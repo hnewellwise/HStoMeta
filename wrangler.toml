@@ -1,5 +1,5 @@
 name = "hubspot-meta-capi"
-main = "src/worker.js"
+main = "worker.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
