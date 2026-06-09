@@ -36,6 +36,8 @@ const CONTACT_PROPERTIES = [
   "total_revenue",
   "lifecyclestage",
   "lastmodifieddate",
+  "hs_date_entered_opportunity",
+  "hs_date_entered_customer",
 ];
 
 const LOOKBACK_DAYS = 7;
@@ -302,9 +304,13 @@ async function buildMetaEvents(contacts, stage, log) {
       userData.fbc = props.hs_facebook_click_id;
     }
 
-    const eventTime = props.lastmodifieddate
-      ? Math.floor(new Date(props.lastmodifieddate).getTime() / 1000)
-      : Math.floor(Date.now() / 1000);
+    const stageDate =
+      stage === "customer"
+        ? props.hs_date_entered_customer
+        : props.hs_date_entered_opportunity;
+    const eventTime = Math.floor(
+      new Date(stageDate || props.lastmodifieddate || Date.now()).getTime() / 1000
+    );
 
     const event = {
       event_name: EVENT_MAP[stage],
