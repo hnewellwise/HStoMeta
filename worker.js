@@ -321,7 +321,7 @@ async function buildMetaEvents(contacts, stage, log) {
 
     if (stage === "customer") {
       const revenue = props.total_revenue ? parseFloat(props.total_revenue) : 0;
-      event.custom_data = { value: revenue || 0, currency: "EUR" };
+      event.custom_data = { value: revenue || 0, currency: "USD" };
     }
 
     events.push(event);
