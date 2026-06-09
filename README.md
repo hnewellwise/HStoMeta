@@ -1,6 +1,6 @@
 # HubSpot → Meta CAPI Offline Conversion Tracking
 
-Cloudflare Worker that runs daily, pulls HubSpot contacts updated in the last 24 hours, and fires offline conversion events to Meta Conversions API.
+Cloudflare Worker that runs daily, pulls HubSpot contacts updated in the last 7 days, deduplicates against KV, and fires offline conversion events to Meta Conversions API.
 
 ## Events
 
@@ -9,7 +9,19 @@ Cloudflare Worker that runs daily, pulls HubSpot contacts updated in the last 24
 | `opportunity` | `QualifiedLead` (custom) |
 | `customer` | `Purchase` (standard) |
 
-Revenue (`total_revenue`) is included as event value on `Purchase` events.
+Revenue (`total_revenue`) is included as event value on `Purchase` events. Event timestamp uses the date the contact entered that lifecycle stage (`hs_date_entered_opportunity` / `hs_date_entered_customer`), falling back to `lastmodifieddate`.
+
+---
+
+## Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `/run` | Trigger a manual sync — returns plain text log |
+| `/logs` | Last 30 run records as JSON |
+| `/contacts?stage=opportunity` | All sent contacts for a stage with enriched data |
+| `/contacts?stage=customer` | As above for customer stage |
+| `/reset` | Flush all dedup keys — use before first live run |
 
 ---
 
@@ -37,7 +49,7 @@ Revenue (`total_revenue`) is included as event value on `Purchase` events.
 
 Then add secrets:
 
-Workers & Pages > hubspot-meta-capi > Settings > Variables > Add secret
+Workers & Pages > hstometa > Settings > Variables > Add secret
 
 | Secret name | Value |
 |---|---|
@@ -46,27 +58,30 @@ Workers & Pages > hubspot-meta-capi > Settings > Variables > Add secret
 | `META_ACCESS_TOKEN` | From step 2 |
 | `META_TEST_EVENT_CODE` | From Events Manager > Test Events (remove once confirmed working) |
 
-### 4. Verify cron trigger
+### 4. KV namespace
 
-Cloudflare dashboard > hubspot-meta-capi > Triggers > Cron triggers
+Create a KV namespace (any name) and bind it to the worker as `CAPI_LOGS`. The namespace ID should be set in `wrangler.toml`.
+
+Workers & Pages > hstometa > Settings > KV namespace bindings > Add binding
+
+| Variable name | KV namespace |
+|---|---|
+| `CAPI_LOGS` | your namespace |
+
+### 5. Verify cron trigger
+
+Cloudflare dashboard > hstometa > Triggers > Cron triggers
 
 Should show `0 6 * * *` (daily at 06:00 UTC). If not, add it manually.
 
 ---
 
-## Testing
+## Going live
 
-Hit the `/run` endpoint to trigger a manual sync:
-
-```
-https://hubspot-meta-capi.<your-subdomain>.workers.dev/run
-```
-
-Check results in:
-- Cloudflare dashboard > Workers > Logs
-- Meta Events Manager > Test Events (while `META_TEST_EVENT_CODE` is set)
-
-Once you're seeing events land correctly in Test Events, remove `META_TEST_EVENT_CODE` from your secrets to go live.
+1. Test with `META_TEST_EVENT_CODE` set and confirm events appear in Meta Events Manager > Test Events
+2. Hit `/reset` to flush any dedup keys written during testing
+3. Remove `META_TEST_EVENT_CODE` from secrets
+4. Hit `/run` — all contacts within the lookback window will fire as live events
 
 ---
 
@@ -75,8 +90,28 @@ Once you're seeing events land correctly in Test Events, remove `META_TEST_EVENT
 | Property | Notes |
 |---|---|
 | `email` | Required — contacts without email are skipped |
-| `phone` | Optional match key |
-| `hs_facebook_click_id` | Optional — sent raw (not hashed) |
-| `total_revenue` | Included as value on Purchase events |
+| `phone` | Optional match key — hashed before sending |
+| `hs_facebook_click_id` | Optional — sent raw as `fbc` (Meta does not want it hashed) |
+| `total_revenue` | Included as value on Purchase events (USD) |
 | `lifecyclestage` | Filter: `opportunity` or `customer` |
-| `hs_lastmodifieddate` | Filter: updated in last 24 hours |
+| `lastmodifieddate` | Lookback filter — contacts modified in last 7 days |
+| `hs_date_entered_opportunity` | Used as event timestamp for QualifiedLead events |
+| `hs_date_entered_customer` | Used as event timestamp for Purchase events |
+
+---
+
+## KV storage
+
+Each sent contact is stored as `sent:{stage}:{contact_id}` with a 60-day expiry. The value is a JSON record:
+
+```json
+{
+  "sent_at": "2026-06-09T17:00:00.000Z",
+  "event_time": "2026-05-01T09:00:00.000Z",
+  "has_fbc": true,
+  "has_phone": false,
+  "value": 4632
+}
+```
+
+Run logs are stored as `run:{timestamp}` and indexed under the `index` key (last 30 retained).

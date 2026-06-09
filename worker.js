@@ -16,9 +16,10 @@
  *   CAPI_LOGS              — bound to angama_capi_logs
  *
  * Endpoints:
- *   /run   — trigger a manual sync, returns plain text log
- *   /logs  — returns last 30 run records as JSON
- *   /reset — deletes all sent: dedup keys (use before first live run)
+ *   /run                        — trigger a manual sync, returns plain text log
+ *   /logs                       — returns last 30 run records as JSON
+ *   /contacts?stage=opportunity — returns all sent contacts for a stage as JSON
+ *   /reset                      — deletes all sent: dedup keys (use before first live run)
  */
 
 const HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/contacts/search";
@@ -59,6 +60,37 @@ export default {
         status: 200,
         headers: { "Content-Type": "text/plain" },
       });
+    }
+
+    if (url.pathname === "/contacts") {
+      const stage = url.searchParams.get("stage") || "opportunity";
+      if (!["opportunity", "customer"].includes(stage)) {
+        return new Response("Invalid stage — use opportunity or customer", { status: 400 });
+      }
+      try {
+        const records = [];
+        let cursor = undefined;
+        do {
+          const result = await env.CAPI_LOGS.list({ prefix: `sent:${stage}:`, cursor, limit: 1000 });
+          await Promise.all(
+            result.keys.map(async (k) => {
+              const val = await env.CAPI_LOGS.get(k.name);
+              if (val) {
+                const parsed = JSON.parse(val);
+                records.push({ contact_id: k.name.split(":")[2], ...parsed });
+              }
+            })
+          );
+          cursor = result.list_complete ? undefined : result.cursor;
+        } while (cursor);
+        records.sort((a, b) => (b.sent_at > a.sent_at ? 1 : -1));
+        return new Response(JSON.stringify(records, null, 2), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(`Error reading contacts: ${err.message}`, { status: 500 });
+      }
     }
 
     if (url.pathname === "/reset") {
@@ -151,7 +183,7 @@ async function runSync(env, logs = []) {
 
     // Only mark as sent if Meta accepted them
     if (received > 0) {
-      await markAsSent(env, fresh, stage);
+      await markAsSent(env, fresh, stage, events);
     }
   }
 
@@ -191,17 +223,28 @@ async function deduplicateContacts(env, contacts, stage) {
   return { fresh, skipped };
 }
 
-async function markAsSent(env, contacts, stage) {
-  const timestamp = new Date().toISOString();
-  // Write in batches of 20 to stay within subrequest limits
+async function markAsSent(env, contacts, stage, events) {
+  const sentAt = new Date().toISOString();
+  // Build a lookup from contact index to its built event for enrichment
   const chunks = chunkArray(contacts, 20);
   for (const chunk of chunks) {
     await Promise.all(
-      chunk.map((contact) =>
-        env.CAPI_LOGS.put(`sent:${stage}:${contact.id}`, timestamp, {
-          expirationTtl: 60 * 24 * 60 * 60,
-        })
-      )
+      chunk.map((contact, i) => {
+        const event = events[contacts.indexOf(contact)];
+        const props = contact.properties;
+        const record = {
+          sent_at: sentAt,
+          event_time: event ? new Date(event.event_time * 1000).toISOString() : null,
+          has_fbc: !!props.hs_facebook_click_id,
+          has_phone: !!(props.phone?.replace(/[^0-9]/g, "")),
+          value: props.total_revenue ? parseFloat(props.total_revenue) : null,
+        };
+        return env.CAPI_LOGS.put(
+          `sent:${stage}:${contact.id}`,
+          JSON.stringify(record),
+          { expirationTtl: 60 * 24 * 60 * 60 }
+        );
+      })
     );
   }
 }
