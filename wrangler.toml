@@ -9,6 +9,11 @@ crons = ["0 6 * * *"]
 binding = "CAPI_LOGS"
 id = "c36e5f36b64d4c98b176464ce4e0c0da"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "hstometa"
+database_id = "a3127e13-db99-4f26-9113-ca847d60d624"
+
 # Secrets are set via Cloudflare dashboard — never commit them here
 # Workers & Pages > your worker > Settings > Variables > Add secret
 #

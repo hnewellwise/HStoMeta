@@ -1,25 +1,25 @@
 /**
  * Cloudflare Worker: HubSpot → Meta CAPI Offline Conversion Tracking
  *
- * Runs on a daily cron trigger at 06:00 UTC.
- * Fetches HubSpot contacts modified in the last 30 days where
- * lifecyclestage = 'opportunity' or 'customer', deduplicates against KV,
- * then fires the appropriate event to Meta Conversions API.
+ * Runs daily at 06:00 UTC. Fetches HubSpot contacts modified in the last
+ * 7 days, deduplicates against D1, fires events to Meta Conversions API.
  *
- * Environment variables (set as secrets in Cloudflare dashboard):
- *   HUBSPOT_ACCESS_TOKEN   — HubSpot private app token
- *   META_PIXEL_ID          — Meta Pixel / Dataset ID
- *   META_ACCESS_TOKEN      — Meta CAPI access token (from Events Manager)
- *   META_TEST_EVENT_CODE   — (optional) remove once confirmed working in Events Manager
+ * Bindings:
+ *   DB         — D1 database (hstometa) — deduplication + run logs
+ *   CAPI_LOGS  — KV namespace — lightweight daily run summary only
  *
- * KV Namespace binding:
- *   CAPI_LOGS              — bound to angama_capi_logs
+ * Secrets:
+ *   HUBSPOT_ACCESS_TOKEN
+ *   META_PIXEL_ID
+ *   META_ACCESS_TOKEN
+ *   META_TEST_EVENT_CODE  (optional — remove once live)
  *
  * Endpoints:
- *   /run                        — trigger a manual sync, returns plain text log
- *   /logs                       — returns last 30 run records as JSON
- *   /contacts?stage=opportunity — returns all sent contacts for a stage as JSON
- *   /reset                      — deletes all sent: dedup keys (use before first live run)
+ *   /run       — manual sync, plain text log
+ *   /contacts  — HTML table of sent contacts (?stage=, ?fbc=1, ?sort=, ?dir=)
+ *   /logs      — last 30 runs as JSON
+ *   /reset     — delete all sent_contacts rows from D1
+ *   /migrate   — one-time: copy KV run logs into D1 (remove after use)
  */
 
 const HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/contacts/search";
@@ -43,6 +43,8 @@ const CONTACT_PROPERTIES = [
 
 const LOOKBACK_DAYS = 7;
 
+const VALID_SORT_COLS = ["contact_id", "stage", "sent_at", "event_time", "has_fbc", "has_phone", "value"];
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 export default {
@@ -63,66 +65,19 @@ export default {
     }
 
     if (url.pathname === "/contacts") {
-      const stage = url.searchParams.get("stage") || "opportunity";
-      if (!["opportunity", "customer"].includes(stage)) {
-        return new Response("Invalid stage — use opportunity or customer", { status: 400 });
-      }
-      try {
-        const records = [];
-        let cursor = undefined;
-        do {
-          const result = await env.CAPI_LOGS.list({ prefix: `sent:${stage}:`, cursor, limit: 1000 });
-          for (const k of result.keys) {
-            if (k.metadata) {
-              records.push({ contact_id: k.name.split(":")[2], ...k.metadata });
-            }
-          }
-          cursor = result.list_complete ? undefined : result.cursor;
-        } while (cursor);
-        records.sort((a, b) => (b.sent_at > a.sent_at ? 1 : -1));
-        return new Response(JSON.stringify(records, null, 2), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(`Error reading contacts: ${err.message}`, { status: 500 });
-      }
-    }
-
-    if (url.pathname === "/reset") {
-      try {
-        let deleted = 0;
-        let cursor = undefined;
-        do {
-          const result = await env.CAPI_LOGS.list({ prefix: "sent:", cursor, limit: 1000 });
-          await Promise.all(result.keys.map((k) => env.CAPI_LOGS.delete(k.name)));
-          deleted += result.keys.length;
-          cursor = result.list_complete ? undefined : result.cursor;
-        } while (cursor);
-        return new Response(`Reset complete — deleted ${deleted} sent keys`, { status: 200 });
-      } catch (err) {
-        return new Response(`Reset error: ${err.message}`, { status: 500 });
-      }
+      return handleContactsPage(request, env);
     }
 
     if (url.pathname === "/logs") {
-      try {
-        const indexRaw = await env.CAPI_LOGS.get("index");
-        if (!indexRaw) return new Response("No logs yet", { status: 200 });
-        const index = JSON.parse(indexRaw);
-        const runs = await Promise.all(
-          index.slice().reverse().map(async (key) => {
-            const val = await env.CAPI_LOGS.get(key);
-            return val ? JSON.parse(val) : null;
-          })
-        );
-        return new Response(JSON.stringify(runs.filter(Boolean), null, 2), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(`Error reading logs: ${err.message}`, { status: 500 });
-      }
+      return handleLogs(env);
+    }
+
+    if (url.pathname === "/reset") {
+      return handleReset(env);
+    }
+
+    if (url.pathname === "/migrate") {
+      return handleMigrate(env);
     }
 
     return new Response("Not found", { status: 404 });
@@ -163,23 +118,20 @@ async function runSync(env, logs = []) {
     runRecord[stage].contacts = contacts.length;
     if (contacts.length === 0) continue;
 
-    // Deduplicate against KV
     const { fresh, skipped } = await deduplicateContacts(env, contacts, stage);
     runRecord[stage].new = fresh.length;
     runRecord[stage].skipped = skipped;
     log(`New: ${fresh.length}, Already sent: ${skipped}`);
     if (fresh.length === 0) continue;
 
-    // Build and send events
-    const events = await buildMetaEvents(fresh, stage, log);
+    const { events, validContacts } = await buildMetaEvents(fresh, stage, log);
     if (events.length === 0) continue;
 
     const received = await sendToMetaCAPI(env, events, stage, log);
     runRecord[stage].meta_received = received;
 
-    // Only mark as sent if Meta accepted them
     if (received > 0) {
-      await markAsSent(env, fresh, stage, events);
+      await markAsSent(env, validContacts, stage, events);
     }
   }
 
@@ -187,29 +139,20 @@ async function runSync(env, logs = []) {
   await writeRunLog(env, runTimestamp, runRecord, logs);
 }
 
-// ─── KV deduplication ─────────────────────────────────────────────────────────
+// ─── D1 deduplication ─────────────────────────────────────────────────────────
 
 async function deduplicateContacts(env, contacts, stage) {
-  // Fetch all sent keys for this stage in one list call — avoids per-contact subrequests
-  const sentKeys = new Set();
-  let cursor = undefined;
+  const { results } = await env.DB.prepare(
+    "SELECT contact_id FROM sent_contacts WHERE stage = ?"
+  ).bind(stage).all();
 
-  do {
-    const result = await env.CAPI_LOGS.list({
-      prefix: `sent:${stage}:`,
-      cursor,
-      limit: 1000,
-    });
-    for (const key of result.keys) sentKeys.add(key.name);
-    cursor = result.list_complete ? undefined : result.cursor;
-  } while (cursor);
+  const sentIds = new Set(results.map((r) => r.contact_id));
 
   const fresh = [];
   let skipped = 0;
 
   for (const contact of contacts) {
-    const key = `sent:${stage}:${contact.id}`;
-    if (sentKeys.has(key)) {
+    if (sentIds.has(contact.id)) {
       skipped++;
     } else {
       fresh.push(contact);
@@ -221,27 +164,29 @@ async function deduplicateContacts(env, contacts, stage) {
 
 async function markAsSent(env, contacts, stage, events) {
   const sentAt = new Date().toISOString();
-  // Build a lookup from contact index to its built event for enrichment
-  const chunks = chunkArray(contacts, 20);
-  for (const chunk of chunks) {
-    await Promise.all(
-      chunk.map((contact, i) => {
-        const event = events[contacts.indexOf(contact)];
-        const props = contact.properties;
-        const record = {
-          sent_at: sentAt,
-          event_time: event ? new Date(event.event_time * 1000).toISOString() : null,
-          has_fbc: !!props.hs_facebook_click_id,
-          has_phone: !!(props.phone?.replace(/[^0-9]/g, "")),
-          value: props.total_revenue ? parseFloat(props.total_revenue) : null,
-        };
-        return env.CAPI_LOGS.put(
-          `sent:${stage}:${contact.id}`,
-          sentAt,
-          { metadata: record, expirationTtl: 60 * 24 * 60 * 60 }
-        );
-      })
+
+  const stmts = contacts.map((contact, i) => {
+    const event = events[i];
+    const props = contact.properties;
+    return env.DB.prepare(
+      `INSERT OR REPLACE INTO sent_contacts
+       (contact_id, stage, sent_at, event_time, has_fbc, has_phone, value)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      contact.id,
+      stage,
+      sentAt,
+      event ? new Date(event.event_time * 1000).toISOString() : null,
+      props.hs_facebook_click_id ? 1 : 0,
+      props.phone?.replace(/[^0-9]/g, "") ? 1 : 0,
+      props.total_revenue ? parseFloat(props.total_revenue) : null
     );
+  });
+
+  // D1 batch: max 100 statements per call
+  const chunks = chunkArray(stmts, 100);
+  for (const chunk of chunks) {
+    await env.DB.batch(chunk);
   }
 }
 
@@ -249,22 +194,247 @@ async function markAsSent(env, contacts, stage, events) {
 
 async function writeRunLog(env, timestamp, record, logs) {
   try {
-    await env.CAPI_LOGS.put(`run:${timestamp}`, JSON.stringify(record));
+    // D1: full structured record
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO run_logs
+       (timestamp, opp_contacts, opp_new, opp_skipped, opp_received,
+        cust_contacts, cust_new, cust_skipped, cust_received, errors)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      timestamp,
+      record.opportunity.contacts,
+      record.opportunity.new,
+      record.opportunity.skipped,
+      record.opportunity.meta_received,
+      record.customer.contacts,
+      record.customer.new,
+      record.customer.skipped,
+      record.customer.meta_received,
+      JSON.stringify(record.errors)
+    ).run();
 
-    const indexRaw = await env.CAPI_LOGS.get("index");
-    const index = indexRaw ? JSON.parse(indexRaw) : [];
-    index.push(`run:${timestamp}`);
+    // KV: lightweight summary — 1 write per run, stays within free tier
+    await env.CAPI_LOGS.put(`run:${timestamp}`, JSON.stringify({
+      timestamp,
+      opp_new: record.opportunity.new,
+      opp_received: record.opportunity.meta_received,
+      cust_new: record.customer.new,
+      cust_received: record.customer.meta_received,
+      errors: record.errors.length,
+    }));
 
-    if (index.length > 30) {
-      const toDelete = index.splice(0, index.length - 30);
-      for (const key of toDelete) await env.CAPI_LOGS.delete(key);
-    }
-
-    await env.CAPI_LOGS.put("index", JSON.stringify(index));
-    logs.push(`Logged to KV: ${timestamp}`);
+    logs.push(`Logged to D1 + KV: ${timestamp}`);
   } catch (err) {
-    logs.push(`KV write error: ${err.message}`);
+    logs.push(`Log write error: ${err.message}`);
   }
+}
+
+// ─── /contacts — HTML table ───────────────────────────────────────────────────
+
+async function handleContactsPage(request, env) {
+  const url = new URL(request.url);
+  const stage = url.searchParams.get("stage") || "all";
+  const fbcOnly = url.searchParams.get("fbc") === "1";
+  const sortCol = VALID_SORT_COLS.includes(url.searchParams.get("sort"))
+    ? url.searchParams.get("sort")
+    : "sent_at";
+  const sortDir = url.searchParams.get("dir") === "asc" ? "ASC" : "DESC";
+
+  const where = [];
+  const binds = [];
+  if (stage !== "all") { where.push("stage = ?"); binds.push(stage); }
+  if (fbcOnly) where.push("has_fbc = 1");
+  const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const [rowsResult, countsResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT * FROM sent_contacts ${whereClause} ORDER BY ${sortCol} ${sortDir}`
+    ).bind(...binds).all(),
+    env.DB.prepare(
+      "SELECT stage, COUNT(*) as n FROM sent_contacts GROUP BY stage"
+    ).all(),
+  ]);
+
+  const countMap = {};
+  for (const c of countsResult.results) countMap[c.stage] = c.n;
+  const total = Object.values(countMap).reduce((a, b) => a + b, 0);
+  const oppCount = countMap["opportunity"] || 0;
+  const custCount = countMap["customer"] || 0;
+
+  const qs = (overrides) => {
+    const p = new URLSearchParams({ stage, fbc: fbcOnly ? "1" : "0", sort: sortCol, dir: sortDir.toLowerCase(), ...overrides });
+    return "?" + p.toString();
+  };
+
+  const sortArrow = (col) => {
+    if (col !== sortCol) return "";
+    return sortDir === "DESC" ? " ↓" : " ↑";
+  };
+
+  const sortLink = (col, label) => {
+    const newDir = col === sortCol && sortDir === "DESC" ? "asc" : "desc";
+    return `<a href="${qs({ sort: col, dir: newDir })}">${label}${sortArrow(col)}</a>`;
+  };
+
+  const tableRows = rowsResult.results.length
+    ? rowsResult.results.map((r) => `
+      <tr>
+        <td class="mono">${r.contact_id}</td>
+        <td><span class="badge badge-${r.stage === "opportunity" ? "opp" : "cust"}">${r.stage}</span></td>
+        <td>${r.sent_at ? r.sent_at.replace("T", " ").slice(0, 19) : "—"}</td>
+        <td>${r.event_time ? r.event_time.replace("T", " ").slice(0, 19) : "—"}</td>
+        <td class="center">${r.has_fbc ? '<span class="tick">✓</span>' : '<span class="cross">—</span>'}</td>
+        <td class="center">${r.has_phone ? '<span class="tick">✓</span>' : '<span class="cross">—</span>'}</td>
+        <td class="right">${r.value != null ? "$" + Number(r.value).toLocaleString() : "—"}</td>
+      </tr>`).join("")
+    : '<tr><td colspan="7" class="empty">No records found</td></tr>';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAPI Contacts</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f4f5; color: #18181b; font-size: 14px; }
+    .header { background: #fff; border-bottom: 1px solid #e4e4e7; padding: 16px 24px; }
+    h1 { font-size: 16px; font-weight: 600; }
+    .stats { font-size: 13px; color: #71717a; margin-top: 4px; }
+    .controls { background: #fff; border-bottom: 1px solid #e4e4e7; padding: 10px 24px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .tab { padding: 5px 14px; border-radius: 6px; font-size: 13px; border: 1px solid #e4e4e7; background: #fff; color: #52525b; text-decoration: none; }
+    .tab:hover { border-color: #a1a1aa; color: #18181b; }
+    .tab.active { background: #18181b; color: #fff; border-color: #18181b; }
+    .fbc-filter { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-left: auto; color: #52525b; cursor: pointer; }
+    .fbc-filter input { cursor: pointer; accent-color: #18181b; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; background: #fff; min-width: 680px; }
+    th { padding: 9px 16px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #71717a; border-bottom: 1px solid #e4e4e7; white-space: nowrap; }
+    th a { color: inherit; text-decoration: none; }
+    th a:hover { color: #18181b; }
+    td { padding: 9px 16px; border-bottom: 1px solid #f4f4f5; color: #3f3f46; font-size: 13px; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; color: #71717a; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+    .badge-opp { background: #eff6ff; color: #1d4ed8; }
+    .badge-cust { background: #f0fdf4; color: #15803d; }
+    .tick { color: #16a34a; font-weight: 600; }
+    .cross { color: #d4d4d8; }
+    .center { text-align: center; }
+    .right { text-align: right; font-variant-numeric: tabular-nums; }
+    .empty { text-align: center; padding: 48px; color: #a1a1aa; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>CAPI Sent Contacts</h1>
+    <div class="stats">${total.toLocaleString()} total &middot; ${oppCount.toLocaleString()} opportunity &middot; ${custCount.toLocaleString()} customer</div>
+  </div>
+  <div class="controls">
+    <a href="${qs({ stage: "all" })}" class="tab ${stage === "all" ? "active" : ""}">All</a>
+    <a href="${qs({ stage: "opportunity" })}" class="tab ${stage === "opportunity" ? "active" : ""}">Opportunity</a>
+    <a href="${qs({ stage: "customer" })}" class="tab ${stage === "customer" ? "active" : ""}">Customer</a>
+    <label class="fbc-filter">
+      <input type="checkbox" ${fbcOnly ? "checked" : ""}
+        onchange="location.href='${qs({ fbc: "FBCVAL" })}'.replace('FBCVAL', this.checked ? '1' : '0')">
+      FBC only
+    </label>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>${sortLink("contact_id", "Contact ID")}</th>
+          <th>${sortLink("stage", "Stage")}</th>
+          <th>${sortLink("sent_at", "Sent At")}</th>
+          <th>${sortLink("event_time", "Event Time")}</th>
+          <th class="center">${sortLink("has_fbc", "FBC")}</th>
+          <th class="center">${sortLink("has_phone", "Phone")}</th>
+          <th class="right">${sortLink("value", "Value")}</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+// ─── /logs ────────────────────────────────────────────────────────────────────
+
+async function handleLogs(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM run_logs ORDER BY timestamp DESC LIMIT 30"
+  ).all();
+  return new Response(JSON.stringify(results, null, 2), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// ─── /reset ───────────────────────────────────────────────────────────────────
+
+async function handleReset(env) {
+  try {
+    const { meta } = await env.DB.prepare("DELETE FROM sent_contacts").run();
+    return new Response(`Reset complete — deleted ${meta.changes} rows`, { status: 200 });
+  } catch (err) {
+    return new Response(`Reset error: ${err.message}`, { status: 500 });
+  }
+}
+
+// ─── /migrate — one-time KV → D1 log migration ───────────────────────────────
+
+async function handleMigrate(env) {
+  const logs = [];
+  try {
+    const indexRaw = await env.CAPI_LOGS.get("index");
+    if (!indexRaw) {
+      return new Response("No KV index found — nothing to migrate", { status: 200 });
+    }
+    const index = JSON.parse(indexRaw);
+    let migrated = 0;
+    for (const key of index) {
+      const val = await env.CAPI_LOGS.get(key);
+      if (!val) continue;
+      try {
+        const r = JSON.parse(val);
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO run_logs
+           (timestamp, opp_contacts, opp_new, opp_skipped, opp_received,
+            cust_contacts, cust_new, cust_skipped, cust_received, errors)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          r.timestamp,
+          r.opportunity?.contacts ?? 0,
+          r.opportunity?.new ?? 0,
+          r.opportunity?.skipped ?? 0,
+          r.opportunity?.meta_received ?? 0,
+          r.customer?.contacts ?? 0,
+          r.customer?.new ?? 0,
+          r.customer?.skipped ?? 0,
+          r.customer?.meta_received ?? 0,
+          JSON.stringify(r.errors ?? [])
+        ).run();
+        migrated++;
+      } catch (e) {
+        logs.push(`Skipped ${key}: ${e.message}`);
+      }
+    }
+    logs.push(`Migrated ${migrated} of ${index.length} run logs from KV to D1`);
+  } catch (err) {
+    logs.push(`Migration error: ${err.message}`);
+  }
+  return new Response(logs.join("\n"), {
+    status: 200,
+    headers: { "Content-Type": "text/plain" },
+  });
 }
 
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
@@ -289,7 +459,6 @@ async function fetchHubSpotContacts(env, stage, sinceMs) {
   do {
     if (after) {
       body.after = after;
-      // Pause between paginated requests to avoid rate limit
       await sleep(1000);
     }
 
@@ -319,6 +488,7 @@ async function fetchHubSpotContacts(env, stage, sinceMs) {
 
 async function buildMetaEvents(contacts, stage, log) {
   const events = [];
+  const validContacts = [];
 
   for (const contact of contacts) {
     const props = contact.properties;
@@ -338,15 +508,14 @@ async function buildMetaEvents(contacts, stage, log) {
       if (cleanPhone) userData.ph = [await sha256(cleanPhone)];
     }
 
-    // fbclid sent raw — Meta does not want it hashed
     if (props.hs_facebook_click_id) {
       userData.fbc = props.hs_facebook_click_id;
     }
 
-    const stageDate =
-      stage === "customer"
-        ? props.hs_date_entered_customer
-        : props.hs_date_entered_opportunity;
+    const stageDate = stage === "customer"
+      ? props.hs_date_entered_customer
+      : props.hs_date_entered_opportunity;
+
     const eventTime = Math.floor(
       new Date(stageDate || props.lastmodifieddate || Date.now()).getTime() / 1000
     );
@@ -364,9 +533,10 @@ async function buildMetaEvents(contacts, stage, log) {
     }
 
     events.push(event);
+    validContacts.push(contact);
   }
 
-  return events;
+  return { events, validContacts };
 }
 
 // ─── Meta CAPI ────────────────────────────────────────────────────────────────
