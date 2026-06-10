@@ -19,7 +19,6 @@
  *   /contacts  — HTML table of sent contacts (?stage=, ?fbc=1, ?sort=, ?dir=)
  *   /logs      — last 30 runs as JSON
  *   /reset     — delete all sent_contacts rows from D1
- *   /migrate   — one-time: copy KV run logs into D1 (remove after use)
  */
 
 const HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/contacts/search";
@@ -74,10 +73,6 @@ export default {
 
     if (url.pathname === "/reset") {
       return handleReset(env);
-    }
-
-    if (url.pathname === "/migrate") {
-      return handleMigrate(env);
     }
 
     return new Response("Not found", { status: 404 });
@@ -387,54 +382,6 @@ async function handleReset(env) {
   } catch (err) {
     return new Response(`Reset error: ${err.message}`, { status: 500 });
   }
-}
-
-// ─── /migrate — one-time KV → D1 log migration ───────────────────────────────
-
-async function handleMigrate(env) {
-  const logs = [];
-  try {
-    const indexRaw = await env.CAPI_LOGS.get("index");
-    if (!indexRaw) {
-      return new Response("No KV index found — nothing to migrate", { status: 200 });
-    }
-    const index = JSON.parse(indexRaw);
-    let migrated = 0;
-    for (const key of index) {
-      const val = await env.CAPI_LOGS.get(key);
-      if (!val) continue;
-      try {
-        const r = JSON.parse(val);
-        await env.DB.prepare(
-          `INSERT OR IGNORE INTO run_logs
-           (timestamp, opp_contacts, opp_new, opp_skipped, opp_received,
-            cust_contacts, cust_new, cust_skipped, cust_received, errors)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          r.timestamp,
-          r.opportunity?.contacts ?? 0,
-          r.opportunity?.new ?? 0,
-          r.opportunity?.skipped ?? 0,
-          r.opportunity?.meta_received ?? 0,
-          r.customer?.contacts ?? 0,
-          r.customer?.new ?? 0,
-          r.customer?.skipped ?? 0,
-          r.customer?.meta_received ?? 0,
-          JSON.stringify(r.errors ?? [])
-        ).run();
-        migrated++;
-      } catch (e) {
-        logs.push(`Skipped ${key}: ${e.message}`);
-      }
-    }
-    logs.push(`Migrated ${migrated} of ${index.length} run logs from KV to D1`);
-  } catch (err) {
-    logs.push(`Migration error: ${err.message}`);
-  }
-  return new Response(logs.join("\n"), {
-    status: 200,
-    headers: { "Content-Type": "text/plain" },
-  });
 }
 
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
