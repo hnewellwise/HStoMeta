@@ -72,18 +72,11 @@ export default {
         let cursor = undefined;
         do {
           const result = await env.CAPI_LOGS.list({ prefix: `sent:${stage}:`, cursor, limit: 1000 });
-          await Promise.all(
-            result.keys.map(async (k) => {
-              const val = await env.CAPI_LOGS.get(k.name);
-              if (!val) return;
-              try {
-                const parsed = JSON.parse(val);
-                records.push({ contact_id: k.name.split(":")[2], ...parsed });
-              } catch {
-                // Legacy plain-timestamp record — skip
-              }
-            })
-          );
+          for (const k of result.keys) {
+            if (k.metadata) {
+              records.push({ contact_id: k.name.split(":")[2], ...k.metadata });
+            }
+          }
           cursor = result.list_complete ? undefined : result.cursor;
         } while (cursor);
         records.sort((a, b) => (b.sent_at > a.sent_at ? 1 : -1));
@@ -244,8 +237,8 @@ async function markAsSent(env, contacts, stage, events) {
         };
         return env.CAPI_LOGS.put(
           `sent:${stage}:${contact.id}`,
-          JSON.stringify(record),
-          { expirationTtl: 60 * 24 * 60 * 60 }
+          sentAt,
+          { metadata: record, expirationTtl: 60 * 24 * 60 * 60 }
         );
       })
     );
