@@ -75,9 +75,12 @@ export default {
           await Promise.all(
             result.keys.map(async (k) => {
               const val = await env.CAPI_LOGS.get(k.name);
-              if (val) {
+              if (!val) return;
+              try {
                 const parsed = JSON.parse(val);
                 records.push({ contact_id: k.name.split(":")[2], ...parsed });
+              } catch {
+                // Legacy plain-timestamp record — skip
               }
             })
           );
