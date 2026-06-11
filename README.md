@@ -9,7 +9,7 @@ Cloudflare Worker that runs daily, pulls HubSpot contacts updated in the last 7 
 | `opportunity` | `QualifiedLead` (custom) |
 | `customer` | `Purchase` (standard) |
 
-Revenue (`total_revenue`) is sent as event value on `Purchase` events in USD. Event timestamp uses the date the contact entered that lifecycle stage (`hs_date_entered_opportunity` / `hs_date_entered_customer`), falling back to `lastmodifieddate`.
+Revenue (`total_revenue`) is sent as event value on `Purchase` events in USD. Event timestamp uses the date the contact entered that lifecycle stage (`hs_v2_date_entered_opportunity` / `hs_v2_date_entered_customer`), falling back to `Date.now()`.
 
 ---
 
@@ -17,10 +17,11 @@ Revenue (`total_revenue`) is sent as event value on `Purchase` events in USD. Ev
 
 1. Runs daily at 06:00 UTC via cron trigger
 2. Fetches contacts from HubSpot modified in the last 7 days, filtered by lifecycle stage
-3. Deduplicates against a D1 database — contacts already sent are skipped
-4. Hashes PII (email, phone) before sending to Meta
-5. Fires events to Meta Conversions API
-6. Marks successfully sent contacts in D1 to prevent re-sending
+3. Filters to contacts whose stage entry date (`hs_v2_date_entered_*`) falls within the same 7-day window — prevents re-sending existing contacts whose records were merely touched
+4. Deduplicates against a D1 database — contacts already sent are skipped regardless
+5. Hashes PII (email, phone) before sending to Meta
+6. Fires events to Meta Conversions API
+7. Marks successfully sent contacts in D1 to prevent re-sending
 
 ---
 
@@ -123,12 +124,32 @@ Should show `0 6 * * *` (daily at 06:00 UTC). If not, add it manually.
 
 ---
 
+## Security
+
+All endpoints require a `?token=` query parameter matching the `WORKER_TOKEN` secret. Without it every request returns 401. Set the secret alongside the others in Cloudflare dashboard:
+
+| Secret | Value |
+|---|---|
+| `WORKER_TOKEN` | Any strong random string — e.g. `openssl rand -hex 32` |
+
+Example: `https://your-worker.workers.dev/logs?token=your-token`
+
+The cron trigger bypasses this check (it calls `runSync` directly, not via HTTP).
+
+---
+
 ## Testing
 
-Trigger a manual sync:
+Trigger a dry run (fetches + dedupes, **nothing sent to Meta**):
 
 ```
-https://your-worker.workers.dev/run
+https://your-worker.workers.dev/preview?token=your-token
+```
+
+Trigger a full manual sync:
+
+```
+https://your-worker.workers.dev/run?token=your-token
 ```
 
 Check results in:
@@ -137,7 +158,7 @@ Check results in:
 
 Once events are landing correctly, remove `META_TEST_EVENT_CODE` from secrets to go live.
 
-**Before your first live run**, hit `/reset` to clear any contacts sent during testing — otherwise the deduplication will skip them.
+**Before your first live run**, hit `/reset?token=your-token` to clear any contacts sent during testing — otherwise the deduplication will skip them.
 
 ---
 
@@ -145,6 +166,7 @@ Once events are landing correctly, remove `META_TEST_EVENT_CODE` from secrets to
 
 | Endpoint | Description |
 |---|---|
+| `/preview` | Dry run — fetch + dedup only, nothing sent to Meta, no D1 writes |
 | `/run` | Trigger a manual sync — returns plain text log |
 | `/contacts` | HTML table of sent contacts (filterable by stage, FBC; sortable) |
 | `/logs` | Last 30 run records as JSON |
@@ -162,5 +184,5 @@ Once events are landing correctly, remove `META_TEST_EVENT_CODE` from secrets to
 | `total_revenue` | Included as value on Purchase events (USD) |
 | `lifecyclestage` | Filter: `opportunity` or `customer` |
 | `lastmodifieddate` | Lookback filter — contacts modified in last 7 days |
-| `hs_date_entered_opportunity` | Used as event timestamp for QualifiedLead events |
-| `hs_date_entered_customer` | Used as event timestamp for Purchase events |
+| `hs_v2_date_entered_opportunity` | Used as event timestamp for QualifiedLead events; also filters to contacts who entered this stage within the lookback window |
+| `hs_v2_date_entered_customer` | Used as event timestamp for Purchase events; same filter applied |

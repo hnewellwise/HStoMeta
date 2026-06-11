@@ -55,6 +55,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (env.WORKER_TOKEN && url.searchParams.get("token") !== env.WORKER_TOKEN) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
     if (url.pathname === "/run") {
       const logs = [];
       await runSync(env, logs);
