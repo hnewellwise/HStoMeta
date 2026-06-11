@@ -36,6 +36,7 @@ const CONTACT_PROPERTIES = [
   "hs_facebook_click_id",
   "total_revenue",
   "lifecyclestage",
+  "lastmodifieddate",
   "hs_lifecyclestage_opportunity_date",
   "hs_lifecyclestage_customer_date",
 ];
@@ -79,18 +80,41 @@ export default {
           log(`ERROR: ${err.message}`);
           continue;
         }
+        const dateProp = stage === "customer"
+          ? "hs_lifecyclestage_customer_date"
+          : "hs_lifecyclestage_opportunity_date";
+
         log(`Contacts found: ${contacts.length}`);
+        const filtered = filterByStageDate(contacts, stage, since);
+        const excluded = contacts.filter((c) => !filtered.includes(c));
+        log(`Stage-date filter: ${filtered.length} pass, ${excluded.length} excluded`);
+
+        if (excluded.length > 0) {
+          log(`\n  [EXCLUDED — stage date outside lookback window]`);
+          for (const c of excluded) {
+            const props = c.properties;
+            log(`  ${c.id} | email: ${props.email || "—"} | stage date: ${props[dateProp] || "no date"} | last modified: ${props.lastmodifieddate || "—"}`);
+          }
+        }
+
+        contacts = filtered;
         if (contacts.length === 0) { log(""); continue; }
 
         const { fresh, skipped } = await deduplicateContacts(env, contacts, stage);
+        log(`\n  [WILL SEND]`);
         log(`New: ${fresh.length}, Already sent: ${skipped}`);
 
         for (const c of fresh) {
           const props = c.properties;
-          const stageDate = stage === "customer"
-            ? props.hs_lifecyclestage_customer_date
-            : props.hs_lifecyclestage_opportunity_date;
-          log(`  ${c.id} | email: ${props.email || "—"} | stage date: ${stageDate || "—"} | fbc: ${props.hs_facebook_click_id ? "yes" : "no"} | value: ${props.total_revenue || "—"}`);
+          log(`  ${c.id} | email: ${props.email || "—"} | stage date: ${props[dateProp] || "—"} | fbc: ${props.hs_facebook_click_id ? "yes" : "no"} | value: ${props.total_revenue || "—"}`);
+        }
+
+        if (skipped > 0) {
+          log(`\n  [SKIPPED — already in D1]`);
+          const sentIds = new Set(fresh.map((c) => c.id));
+          for (const c of contacts.filter((c) => !sentIds.has(c.id))) {
+            log(`  ${c.id} | email: ${c.properties.email || "—"}`);
+          }
         }
         log("");
       }
@@ -149,6 +173,8 @@ async function runSync(env, logs = []) {
     }
 
     log(`Contacts found: ${contacts.length}`);
+    contacts = filterByStageDate(contacts, stage, since);
+    log(`After stage-date filter: ${contacts.length}`);
     runRecord[stage].contacts = contacts.length;
     if (contacts.length === 0) continue;
 
@@ -426,16 +452,12 @@ async function handleReset(env) {
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
 
 async function fetchHubSpotContacts(env, stage, sinceMs) {
-  const stageDateProp = stage === "customer"
-    ? "hs_lifecyclestage_customer_date"
-    : "hs_lifecyclestage_opportunity_date";
-
   const body = {
     filterGroups: [
       {
         filters: [
           { propertyName: "lifecyclestage", operator: "EQ", value: stage },
-          { propertyName: stageDateProp, operator: "GTE", value: sinceMs },
+          { propertyName: "lastmodifieddate", operator: "GTE", value: sinceMs },
         ],
       },
     ],
@@ -565,6 +587,17 @@ async function sendToMetaCAPI(env, events, stage, log) {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
+
+function filterByStageDate(contacts, stage, sinceMs) {
+  const dateProp = stage === "customer"
+    ? "hs_lifecyclestage_customer_date"
+    : "hs_lifecyclestage_opportunity_date";
+  return contacts.filter((c) => {
+    const val = c.properties[dateProp];
+    if (!val) return false;
+    return new Date(val).getTime() >= sinceMs;
+  });
+}
 
 async function sha256(value) {
   const encoder = new TextEncoder();
