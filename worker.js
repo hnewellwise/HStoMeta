@@ -33,6 +33,10 @@ const EVENT_MAP = {
 const CONTACT_PROPERTIES = [
   "email",
   "phone",
+  "firstname",
+  "lastname",
+  "ip_city",
+  "country",
   "hs_facebook_click_id",
   "total_revenue",
   "lifecyclestage",
@@ -516,13 +520,19 @@ async function buildMetaEvents(contacts, stage, log) {
     }
 
     const userData = {
-      em: [await sha256(email)],
+      em: await sha256(email),
+      external_id: await sha256(contact.id),
     };
 
     if (props.phone) {
       const cleanPhone = props.phone.replace(/[^0-9]/g, "");
-      if (cleanPhone) userData.ph = [await sha256(cleanPhone)];
+      if (cleanPhone) userData.ph = await sha256(cleanPhone);
     }
+
+    if (props.firstname) userData.fn = await sha256(props.firstname.trim().toLowerCase());
+    if (props.lastname) userData.ln = await sha256(props.lastname.trim().toLowerCase());
+    if (props.ip_city) userData.ct = await sha256(props.ip_city.trim().toLowerCase().replace(/\s/g, ""));
+    if (props.country) userData.country = await sha256(props.country.trim().toLowerCase());
 
     if (props.hs_facebook_click_id) {
       userData.fbc = props.hs_facebook_click_id;
@@ -539,13 +549,14 @@ async function buildMetaEvents(contacts, stage, log) {
     const event = {
       event_name: EVENT_MAP[stage],
       event_time: eventTime,
+      event_id: `${contact.id}_${stage}`,
       action_source: "system_generated",
       user_data: userData,
     };
 
     if (stage === "customer") {
       const revenue = props.total_revenue ? parseFloat(props.total_revenue) : 0;
-      event.custom_data = { value: revenue || 0, currency: "USD" };
+      event.custom_data = { value: parseFloat((revenue || 0).toFixed(2)), currency: "USD" };
     }
 
     events.push(event);

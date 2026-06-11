@@ -176,13 +176,18 @@ Once events are landing correctly, remove `META_TEST_EVENT_CODE` from secrets to
 
 ## Contact properties used
 
-| Property | Notes |
-|---|---|
-| `email` | Required — contacts without email are skipped |
-| `phone` | Optional match key — hashed before sending |
-| `hs_facebook_click_id` | Optional — sent raw as `fbc` (not hashed) |
-| `total_revenue` | Included as value on Purchase events (USD) |
-| `lifecyclestage` | Filter: `opportunity` or `customer` |
-| `lastmodifieddate` | Lookback filter — contacts modified in last 7 days |
-| `hs_v2_date_entered_opportunity` | Used as event timestamp for QualifiedLead events; also filters to contacts who entered this stage within the lookback window |
-| `hs_v2_date_entered_customer` | Used as event timestamp for Purchase events; same filter applied |
+| Property | Meta field | Notes |
+|---|---|---|
+| `email` | `em` | Required — contacts without email are skipped. Hashed. |
+| `phone` | `ph` | Optional match key. Hashed. |
+| `firstname` | `fn` | Hashed. |
+| `lastname` | `ln` | Hashed. |
+| `ip_city` | `ct` | Set via HubSpot workflow from IP address. Hashed. |
+| `country` | `country` | Manually set on contact. Hashed. |
+| `hs_facebook_click_id` | `fbc` | Sent raw (not hashed). |
+| HubSpot contact ID | `external_id` | Sent as hashed `external_id` — improves match rate. |
+| `total_revenue` | `value` | Purchase events only. Sent as float, USD. |
+| `lifecyclestage` | — | Filter: `opportunity` or `customer` |
+| `lastmodifieddate` | — | Lookback filter — contacts modified in last 7 days |
+| `hs_v2_date_entered_opportunity` | `event_time` | QualifiedLead event timestamp + 7-day filter |
+| `hs_v2_date_entered_customer` | `event_time` | Purchase event timestamp + 7-day filter |
