@@ -18,6 +18,7 @@
  *   /run       — manual sync, plain text log
  *   /contacts  — HTML table of sent contacts (?stage=, ?fbc=1, ?sort=, ?dir=)
  *   /logs      — last 30 runs as JSON
+ *   /preview   — dry run: fetch + dedup only, no Meta send, no D1 writes
  *   /reset     — delete all sent_contacts rows from D1
  */
 
@@ -35,7 +36,6 @@ const CONTACT_PROPERTIES = [
   "hs_facebook_click_id",
   "total_revenue",
   "lifecyclestage",
-  "lastmodifieddate",
   "hs_date_entered_opportunity",
   "hs_date_entered_customer",
 ];
@@ -57,6 +57,45 @@ export default {
     if (url.pathname === "/run") {
       const logs = [];
       await runSync(env, logs);
+      return new Response(logs.join("\n"), {
+        status: 200,
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+
+    if (url.pathname === "/preview") {
+      const logs = [];
+      const log = (msg) => { console.log(msg); logs.push(msg); };
+      const since = Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+      log(`Preview — lookback: ${LOOKBACK_DAYS} days (since ${new Date(since).toISOString()})\n`);
+
+      for (const stage of ["opportunity", "customer"]) {
+        await sleep(5000);
+        log(`--- Stage: ${stage} ---`);
+        let contacts;
+        try {
+          contacts = await fetchHubSpotContacts(env, stage, since);
+        } catch (err) {
+          log(`ERROR: ${err.message}`);
+          continue;
+        }
+        log(`Contacts found: ${contacts.length}`);
+        if (contacts.length === 0) { log(""); continue; }
+
+        const { fresh, skipped } = await deduplicateContacts(env, contacts, stage);
+        log(`New: ${fresh.length}, Already sent: ${skipped}`);
+
+        for (const c of fresh) {
+          const props = c.properties;
+          const stageDate = stage === "customer"
+            ? props.hs_date_entered_customer
+            : props.hs_date_entered_opportunity;
+          log(`  ${c.id} | email: ${props.email || "—"} | stage date: ${stageDate || "—"} | fbc: ${props.hs_facebook_click_id ? "yes" : "no"} | value: ${props.total_revenue || "—"}`);
+        }
+        log("");
+      }
+
+      log("Preview complete — nothing sent.");
       return new Response(logs.join("\n"), {
         status: 200,
         headers: { "Content-Type": "text/plain" },
@@ -387,12 +426,16 @@ async function handleReset(env) {
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
 
 async function fetchHubSpotContacts(env, stage, sinceMs) {
+  const stageDateProp = stage === "customer"
+    ? "hs_date_entered_customer"
+    : "hs_date_entered_opportunity";
+
   const body = {
     filterGroups: [
       {
         filters: [
           { propertyName: "lifecyclestage", operator: "EQ", value: stage },
-          { propertyName: "lastmodifieddate", operator: "GTE", value: sinceMs },
+          { propertyName: stageDateProp, operator: "GTE", value: sinceMs },
         ],
       },
     ],
@@ -464,7 +507,7 @@ async function buildMetaEvents(contacts, stage, log) {
       : props.hs_date_entered_opportunity;
 
     const eventTime = Math.floor(
-      new Date(stageDate || props.lastmodifieddate || Date.now()).getTime() / 1000
+      new Date(stageDate || Date.now()).getTime() / 1000
     );
 
     const event = {
