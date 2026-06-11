@@ -36,8 +36,8 @@ const CONTACT_PROPERTIES = [
   "hs_facebook_click_id",
   "total_revenue",
   "lifecyclestage",
-  "hs_date_entered_opportunity",
-  "hs_date_entered_customer",
+  "hs_lifecyclestage_opportunity_date",
+  "hs_lifecyclestage_customer_date",
 ];
 
 const LOOKBACK_DAYS = 7;
@@ -88,8 +88,8 @@ export default {
         for (const c of fresh) {
           const props = c.properties;
           const stageDate = stage === "customer"
-            ? props.hs_date_entered_customer
-            : props.hs_date_entered_opportunity;
+            ? props.hs_lifecyclestage_customer_date
+            : props.hs_lifecyclestage_opportunity_date;
           log(`  ${c.id} | email: ${props.email || "—"} | stage date: ${stageDate || "—"} | fbc: ${props.hs_facebook_click_id ? "yes" : "no"} | value: ${props.total_revenue || "—"}`);
         }
         log("");
@@ -427,8 +427,8 @@ async function handleReset(env) {
 
 async function fetchHubSpotContacts(env, stage, sinceMs) {
   const stageDateProp = stage === "customer"
-    ? "hs_date_entered_customer"
-    : "hs_date_entered_opportunity";
+    ? "hs_lifecyclestage_customer_date"
+    : "hs_lifecyclestage_opportunity_date";
 
   const body = {
     filterGroups: [
@@ -503,8 +503,8 @@ async function buildMetaEvents(contacts, stage, log) {
     }
 
     const stageDate = stage === "customer"
-      ? props.hs_date_entered_customer
-      : props.hs_date_entered_opportunity;
+      ? props.hs_lifecyclestage_customer_date
+      : props.hs_lifecyclestage_opportunity_date;
 
     const eventTime = Math.floor(
       new Date(stageDate || Date.now()).getTime() / 1000
