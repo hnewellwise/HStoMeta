@@ -37,8 +37,8 @@ const CONTACT_PROPERTIES = [
   "total_revenue",
   "lifecyclestage",
   "lastmodifieddate",
-  "hs_lifecyclestage_opportunity_date",
-  "hs_lifecyclestage_customer_date",
+  "hs_v2_date_entered_opportunity",
+  "hs_v2_date_entered_customer",
 ];
 
 const LOOKBACK_DAYS = 7;
@@ -81,8 +81,8 @@ export default {
           continue;
         }
         const dateProp = stage === "customer"
-          ? "hs_lifecyclestage_customer_date"
-          : "hs_lifecyclestage_opportunity_date";
+          ? "hs_v2_date_entered_customer"
+          : "hs_v2_date_entered_opportunity";
 
         log(`Contacts found: ${contacts.length}`);
         const filtered = filterByStageDate(contacts, stage, since);
@@ -525,8 +525,8 @@ async function buildMetaEvents(contacts, stage, log) {
     }
 
     const stageDate = stage === "customer"
-      ? props.hs_lifecyclestage_customer_date
-      : props.hs_lifecyclestage_opportunity_date;
+      ? props.hs_v2_date_entered_customer
+      : props.hs_v2_date_entered_opportunity;
 
     const eventTime = Math.floor(
       new Date(stageDate || Date.now()).getTime() / 1000
@@ -590,8 +590,8 @@ async function sendToMetaCAPI(env, events, stage, log) {
 
 function filterByStageDate(contacts, stage, sinceMs) {
   const dateProp = stage === "customer"
-    ? "hs_lifecyclestage_customer_date"
-    : "hs_lifecyclestage_opportunity_date";
+    ? "hs_v2_date_entered_customer"
+    : "hs_v2_date_entered_opportunity";
   return contacts.filter((c) => {
     const val = c.properties[dateProp];
     if (!val) return false;
