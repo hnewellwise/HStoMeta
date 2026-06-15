@@ -41,6 +41,7 @@ const CONTACT_PROPERTIES = [
   "total_revenue",
   "lifecyclestage",
   "lastmodifieddate",
+  "createdate",
   "hs_v2_date_entered_opportunity",
   "hs_v2_date_entered_customer",
 ];
@@ -535,7 +536,10 @@ async function buildMetaEvents(contacts, stage, log) {
     if (props.country) userData.country = await sha256(props.country.trim().toLowerCase());
 
     if (props.hs_facebook_click_id) {
-      userData.fbc = props.hs_facebook_click_id;
+      const creationTime = props.createdate
+        ? new Date(props.createdate).getTime()
+        : Date.now();
+      userData.fbc = `fb.1.${creationTime}.${props.hs_facebook_click_id}`;
     }
 
     const stageDate = stage === "customer"
